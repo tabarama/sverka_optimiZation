@@ -1,0 +1,12 @@
+# Артефакты работы скрипта
+sverka.log
+old/
+сверка_*.xlsx
+~$*.xlsx
+
+# Python
+__pycache__/
+*.pyc
+
+# Сгенерированные обёртки win32com (makepy)
+gen_py/
