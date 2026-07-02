@@ -433,11 +433,16 @@ def refresh_all(app, wb):
 
 # --- построители сводных таблиц ---
 #
-# Порядок настройки полей выполняется при pt.ManualUpdate = True (Excel не
-# пересчитывает сводную после каждого изменения). Это устраняет ошибку
-# «Нельзя установить свойство Orientation класса PivotField», возникающую из-за
-# промежуточных пересчётов при добавлении поля фильтра. Фильтры по пунктам
-# применяются уже после pt.ManualUpdate = False, когда пункты доступны.
+# Настройка полей выполняется на «живой» сводной (pt.ManualUpdate = False).
+# Порядок строгий и повторяет действия человека: строки → ЗНАЧЕНИЯ → фильтры
+# (страничные поля). Это принципиально:
+#   • страничное поле нельзя поставить на «скелет» сводной без значений —
+#     Excel бросает «Нельзя установить свойство Orientation класса PivotField»
+#     (так срывался фильтр «ЛПР+ЮЛ»);
+#   • для поля, которое одновременно и значение, и фильтр («КВ Оператор Итого»),
+#     сначала добавляем его как значение, ЗАТЕМ делаем страничным — так
+#     сохраняются обе роли (как в ручном файле: axis="axisPage" + dataField="1").
+#     При обратном порядке AddDataField снимал роль фильтра.
 
 def _pivot_items(pf):
     """Список пунктов поля (через .Item(k) — работает и при раннем связывании COM)."""
@@ -454,26 +459,55 @@ def _add_value(pt, source_name):
     return df
 
 
+def _is_page(pt, name):
+    try:
+        return pt.PivotFields(name).Orientation == XL_PAGE_FIELD
+    except Exception:
+        return False
+
+
 def _set_page_orientation(pt, name):
-    """Поставить поле в область фильтров. Сначала пробуем при отложенном пересчёте,
-    при неудаче — при «живом» (ManualUpdate=False). Возвращает True при успехе."""
+    """Сделать поле страничным (область фильтров).
+
+    Способ 1 — прямое присвоение Orientation: надёжно для ТЕКСТОВЫХ полей
+    («Оператор оплачено ранее») и для поля, уже добавленного как значение
+    («КВ Оператор Итого»).
+
+    Способ 2 — метод AddFields(PageFields=...): это ровно то, что делает
+    перетаскивание поля в область «Фильтры» в интерфейсе Excel. Другой путь в
+    COM, чем присвоение Orientation, и он проходит там, где Orientation срывается
+    («Нельзя установить свойство Orientation класса PivotField») — а именно на
+    «свежем» числовом поле-фильтре («ЛПР+ЮЛ»).
+
+    Возвращает True только если поле действительно стало страничным."""
+    errs = []
+
+    # Способ 1 — прямое присвоение Orientation.
     try:
         pt.PivotFields(name).Orientation = XL_PAGE_FIELD
-        return True
-    except Exception as e1:
+        if _is_page(pt, name):
+            return True
+    except Exception as e:
+        errs.append("orient:%r" % (e,))
+
+    # Способ 2 — AddFields (UI-эквивалент перетаскивания в «Фильтры»).
+    # AddToTable=True: добавляем страничное поле, НЕ трогая строки/значения.
+    try:
+        pt.AddFields(PageFields=name, AddToTable=True)          # именованные аргументы
+        if _is_page(pt, name):
+            return True
+    except Exception as e:
+        errs.append("addfields_kw:%r" % (e,))
         try:
-            pt.ManualUpdate = False
-            pt.PivotFields(name).Orientation = XL_PAGE_FIELD
-            ok = True
+            pt.AddFields(None, None, name, True)                # позиционно (запасной путь)
+            if _is_page(pt, name):
+                return True
         except Exception as e2:
-            log.warning("Поле фильтра «%s»: не удалось (Orientation): %s / %s", name, e1, e2)
-            ok = False
-        finally:
-            try:
-                pt.ManualUpdate = True
-            except Exception:
-                pass
-        return ok
+            errs.append("addfields_pos:%r" % (e2,))
+
+    log.error("ФИЛЬТР НЕ УСТАНОВЛЕН: поле «%s» не стало страничным (%s)",
+              name, " | ".join(errs) or "неизвестно")
+    return False
 
 
 def _hide_zero_item(pf):
@@ -522,18 +556,29 @@ def _make_pivot(cache, dest, name, rows, values, pages, classic=False, keep_subt
        classic  — классический (табличный) макет + перетаскивание в сетке;
        keep_subtotal — единственное поле строк, у которого оставить промежуточные итоги."""
     pt = cache.CreatePivotTable(dest, name)
+    # Работаем на «живой» сводной — так установка страничных полей надёжна.
     try:
-        pt.ManualUpdate = True                       # откладываем пересчёт на время настройки
+        pt.ManualUpdate = False
     except Exception:
         pass
 
-    # Поля строк
+    # 1) Поля строк (строго по возрастанию позиции)
     for i, nm in enumerate(rows, start=1):
         f = pt.PivotFields(nm)
         f.Orientation = XL_ROW_FIELD
         f.Position = i
 
-    # Классический (табличный) макет
+    # 2) Значения (сумма) — ДО фильтров. Значения «материализуют» сводную,
+    #    иначе установка страничного поля падает с ошибкой Orientation.
+    for nm in values:
+        _add_value(pt, nm)
+
+    # 3) Поля фильтров — ПОСЛЕ значений. Для поля, которое одновременно значение
+    #    и фильтр («КВ Оператор Итого»), это сохраняет обе роли.
+    for nm, _mode, _arg in pages:
+        _set_page_orientation(pt, nm)
+
+    # 4) Классический (табличный) макет
     if classic:
         try:
             pt.RowAxisLayout(XL_TABULAR_ROW)
@@ -544,7 +589,7 @@ def _make_pivot(cache, dest, name, rows, values, pages, classic=False, keep_subt
         except Exception as e:
             log.warning("Классический макет «%s» не применился: %s", name, e)
 
-    # Промежуточные итоги: убрать у всех полей строк, кроме keep_subtotal
+    # 5) Промежуточные итоги: убрать у всех полей строк, кроме keep_subtotal
     if keep_subtotal is not None:
         no_sub = tuple([False] * 12)
         for nm in rows:
@@ -554,22 +599,7 @@ def _make_pivot(cache, dest, name, rows, values, pages, classic=False, keep_subt
                 except Exception as e:
                     log.warning("Не удалось убрать итоги у «%s»: %s", nm, e)
 
-    # Поля фильтров (только ориентация; скрытие пунктов — после пересчёта).
-    # Ставим фильтры ДО значений — это устойчивый порядок (строки → фильтры → значения).
-    for nm, _mode, _arg in pages:
-        _set_page_orientation(pt, nm)
-
-    # Значения (сумма)
-    for nm in values:
-        _add_value(pt, nm)
-
-    # Пересчёт сводной — после него доступны пункты полей фильтров
-    try:
-        pt.ManualUpdate = False
-    except Exception:
-        pass
-
-    # Применяем фильтры по пунктам
+    # 6) Применяем фильтры по пунктам (на «живой» сводной пункты доступны)
     for nm, mode, arg in pages:
         try:
             pf = pt.PivotFields(nm)
@@ -579,6 +609,12 @@ def _make_pivot(cache, dest, name, rows, values, pages, classic=False, keep_subt
                 _show_only(pf, arg)
         except Exception as e:
             log.warning("Фильтр «%s» не применился: %s", nm, e)
+
+    # 7) Финальный пересчёт — фиксируем итоговую геометрию сводной
+    try:
+        pt.Update()
+    except Exception:
+        pass
     return pt
 
 
@@ -636,23 +672,28 @@ def build_pivots(app, wb, ws, lo):
     cache = wb.PivotCaches().Create(XL_DATABASE, TABLE_NAME)
     tbl = lo.Range
     tbl_bottom = tbl.Row + tbl.Rows.Count - 1
-    start_row = tbl_bottom + 2            # ≈ две строки ниже таблицы
+    start_row = tbl_bottom + 2            # курсор на 2 строки ниже таблицы
+                                          # (здесь окажется строка фильтра сводной 1)
     col_b = 2
 
-    # Сводная 1 — Партнёры/ЛПР (столбец B)
+    # Сводная 1 — Партнёры/ЛПР (столбец B). Строится и ФИЛЬТРУЕТСЯ полностью,
+    # только потом читаем её реальную (уже сжатую фильтром) геометрию.
     p1 = _pivot_partners(cache, ws, ws.Cells(start_row, col_b))
-    ext1 = p1.TableRange2
-    body_top = p1.TableRange1.Row                       # верх тела (без фильтров)
+    ext1 = p1.TableRange2                               # весь диапазон, включая фильтр
+    body_top = p1.TableRange1.Row                       # верх тела (под строкой фильтра)
     p2_col = ext1.Column + ext1.Columns.Count + 1       # справа, через один пустой столбец
 
-    # Сводная 2 — Агенты (справа, выровнена по телу сводной 1)
+    # Сводная 2 — Агенты (справа, верх тела выровнен с телом сводной 1)
     p2 = _pivot_agents(cache, ws, ws.Cells(body_top, p2_col))
 
-    # Сводная 3 — Операторы (ниже обеих + несколько пустых строк)
+    # Сводная 3 — Операторы. Позицию считаем ПОСЛЕ того, как сводные 1 и 2
+    # полностью построены и отфильтрованы — перечитываем их низ заново.
+    # По алгоритму: первая пустая строка под сводными и три следующие
+    # пропускаются → сводная начинается на (низ + 5).
     ext1 = p1.TableRange2
     ext2 = p2.TableRange2
     bottom = max(ext1.Row + ext1.Rows.Count - 1, ext2.Row + ext2.Rows.Count - 1)
-    p3 = _pivot_operators(cache, ws, ws.Cells(bottom + 3, col_b))
+    p3 = _pivot_operators(cache, ws, ws.Cells(bottom + 5, col_b))
 
     _autofit_pivots(ws, start_row, [p1, p2, p3])
 
