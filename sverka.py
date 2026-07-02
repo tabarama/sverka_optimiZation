@@ -432,17 +432,17 @@ def refresh_all(app, wb):
 
 
 # --- построители сводных таблиц ---
+#
+# Порядок настройки полей выполняется при pt.ManualUpdate = True (Excel не
+# пересчитывает сводную после каждого изменения). Это устраняет ошибку
+# «Нельзя установить свойство Orientation класса PivotField», возникающую из-за
+# промежуточных пересчётов при добавлении поля фильтра. Фильтры по пунктам
+# применяются уже после pt.ManualUpdate = False, когда пункты доступны.
 
 def _pivot_items(pf):
+    """Список пунктов поля (через .Item(k) — работает и при раннем связывании COM)."""
     coll = pf.PivotItems()
-    return [coll(k) for k in range(1, coll.Count + 1)]
-
-
-def _add_row_fields(pt, names):
-    for i, nm in enumerate(names, start=1):
-        f = pt.PivotFields(nm)
-        f.Orientation = XL_ROW_FIELD
-        f.Position = i
+    return [coll.Item(k) for k in range(1, coll.Count + 1)]
 
 
 def _add_value(pt, source_name):
@@ -452,6 +452,28 @@ def _add_value(pt, source_name):
     except Exception:
         pass
     return df
+
+
+def _set_page_orientation(pt, name):
+    """Поставить поле в область фильтров. Сначала пробуем при отложенном пересчёте,
+    при неудаче — при «живом» (ManualUpdate=False). Возвращает True при успехе."""
+    try:
+        pt.PivotFields(name).Orientation = XL_PAGE_FIELD
+        return True
+    except Exception as e1:
+        try:
+            pt.ManualUpdate = False
+            pt.PivotFields(name).Orientation = XL_PAGE_FIELD
+            ok = True
+        except Exception as e2:
+            log.warning("Поле фильтра «%s»: не удалось (Orientation): %s / %s", name, e1, e2)
+            ok = False
+        finally:
+            try:
+                pt.ManualUpdate = True
+            except Exception:
+                pass
+        return ok
 
 
 def _hide_zero_item(pf):
@@ -492,70 +514,107 @@ def _show_only(pf, wanted):
             pass
 
 
-def _add_page_filter(pt, source_name):
-    pf = pt.PivotFields(source_name)
-    pf.Orientation = XL_PAGE_FIELD
-    return pf
+def _make_pivot(cache, dest, name, rows, values, pages, classic=False, keep_subtotal=None):
+    """Универсальный построитель сводной.
+       rows     — список полей строк (по порядку);
+       values   — список полей значений (сумма);
+       pages    — список (поле, режим, аргумент), режим: 'exclude_zero' | 'only';
+       classic  — классический (табличный) макет + перетаскивание в сетке;
+       keep_subtotal — единственное поле строк, у которого оставить промежуточные итоги."""
+    pt = cache.CreatePivotTable(dest, name)
+    try:
+        pt.ManualUpdate = True                       # откладываем пересчёт на время настройки
+    except Exception:
+        pass
+
+    # Поля строк
+    for i, nm in enumerate(rows, start=1):
+        f = pt.PivotFields(nm)
+        f.Orientation = XL_ROW_FIELD
+        f.Position = i
+
+    # Классический (табличный) макет
+    if classic:
+        try:
+            pt.RowAxisLayout(XL_TABULAR_ROW)
+        except Exception as e:
+            log.warning("Табличный макет «%s» не применился: %s", name, e)
+        try:
+            pt.InGridDropZones = True
+        except Exception as e:
+            log.warning("Классический макет «%s» не применился: %s", name, e)
+
+    # Промежуточные итоги: убрать у всех полей строк, кроме keep_subtotal
+    if keep_subtotal is not None:
+        no_sub = tuple([False] * 12)
+        for nm in rows:
+            if nm != keep_subtotal:
+                try:
+                    pt.PivotFields(nm).Subtotals = no_sub
+                except Exception as e:
+                    log.warning("Не удалось убрать итоги у «%s»: %s", nm, e)
+
+    # Поля фильтров (только ориентация; скрытие пунктов — после пересчёта).
+    # Ставим фильтры ДО значений — это устойчивый порядок (строки → фильтры → значения).
+    for nm, _mode, _arg in pages:
+        _set_page_orientation(pt, nm)
+
+    # Значения (сумма)
+    for nm in values:
+        _add_value(pt, nm)
+
+    # Пересчёт сводной — после него доступны пункты полей фильтров
+    try:
+        pt.ManualUpdate = False
+    except Exception:
+        pass
+
+    # Применяем фильтры по пунктам
+    for nm, mode, arg in pages:
+        try:
+            pf = pt.PivotFields(nm)
+            if mode == "exclude_zero":
+                _hide_zero_item(pf)
+            elif mode == "only":
+                _show_only(pf, arg)
+        except Exception as e:
+            log.warning("Фильтр «%s» не применился: %s", nm, e)
+    return pt
 
 
 def _pivot_partners(cache, ws, dest):
     """Сводная 1 — Партнёры/ЛПР."""
-    pt = cache.CreatePivotTable(dest, "свПартнеры")
-    _add_row_fields(pt, [H_UL, H_ID_TO, H_COMMENT])
-    _add_value(pt, H_KV_UL)
-    _add_value(pt, H_KV_LPR)
-    try:
-        _hide_zero_item(_add_page_filter(pt, H_LPR_UL))   # фильтр ЛПР+ЮЛ: всё, кроме 0,00
-    except Exception as e:
-        log.warning("Фильтр «ЛПР+ЮЛ» не применился: %s", e)
-    return pt
+    return _make_pivot(
+        cache, dest, "свПартнеры",
+        rows=[H_UL, H_ID_TO, H_COMMENT],
+        values=[H_KV_UL, H_KV_LPR],
+        pages=[(H_LPR_UL, "exclude_zero", None)],      # фильтр ЛПР+ЮЛ: всё, кроме 0,00
+    )
 
 
 def _pivot_agents(cache, ws, dest):
     """Сводная 2 — Агенты."""
-    pt = cache.CreatePivotTable(dest, "свАгенты")
-    _add_row_fields(pt, [H_AGENT_UL])
-    _add_value(pt, H_KV_AGENT)
-    return pt
+    return _make_pivot(
+        cache, dest, "свАгенты",
+        rows=[H_AGENT_UL],
+        values=[H_KV_AGENT],
+        pages=[],
+    )
 
 
 def _pivot_operators(cache, ws, dest):
-    """Сводная 3 — Операторы (классический макет, без промежуточных итогов, кроме «Агент ЮЛ»)."""
-    pt = cache.CreatePivotTable(dest, "свОператоры")
-    rowfields = [H_AGENT_UL, H_OFORMIL, H_ID_OFORM, H_UL, H_COMMENT]
-    _add_row_fields(pt, rowfields)
-    _add_value(pt, H_KV_OPER)
-
-    # Классический (табличный) макет
-    try:
-        pt.RowAxisLayout(XL_TABULAR_ROW)
-    except Exception as e:
-        log.warning("Табличный макет не применился: %s", e)
-    try:
-        pt.InGridDropZones = True
-    except Exception as e:
-        log.warning("Классический макет (InGridDropZones) не применился: %s", e)
-
-    # Убрать промежуточные итоги у всех полей строк, кроме «Агент ЮЛ»
-    no_sub = tuple([False] * 12)
-    for nm in rowfields:
-        if nm != H_AGENT_UL:
-            try:
-                pt.PivotFields(nm).Subtotals = no_sub
-            except Exception as e:
-                log.warning("Не удалось убрать итоги у «%s»: %s", nm, e)
-
-    # Фильтр 1: КВ Оператор Итого (то же поле, что и значение) — всё, кроме 0,00
-    try:
-        _hide_zero_item(_add_page_filter(pt, H_KV_OPER))
-    except Exception as e:
-        log.warning("Фильтр «%s» не применился: %s", H_KV_OPER, e)
-    # Фильтр 2: Оператор оплачено ранее = «Нет»
-    try:
-        _show_only(_add_page_filter(pt, H_OPER_RANEE), "Нет")
-    except Exception as e:
-        log.warning("Фильтр «%s» не применился: %s", H_OPER_RANEE, e)
-    return pt
+    """Сводная 3 — Операторы (классический макет, итоги только у «Агент ЮЛ»)."""
+    return _make_pivot(
+        cache, dest, "свОператоры",
+        rows=[H_AGENT_UL, H_OFORMIL, H_ID_OFORM, H_UL, H_COMMENT],
+        values=[H_KV_OPER],
+        pages=[
+            (H_KV_OPER, "exclude_zero", None),         # КВ Оператор Итого: всё, кроме 0,00
+            (H_OPER_RANEE, "only", "Нет"),             # Оператор оплачено ранее = «Нет»
+        ],
+        classic=True,
+        keep_subtotal=H_AGENT_UL,
+    )
 
 
 def _autofit_pivots(ws, start_row, pivots):
