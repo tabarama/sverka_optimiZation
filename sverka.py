@@ -531,8 +531,40 @@ def _hide_zero_item(pf):
 
 
 def _show_only(pf, wanted):
-    """Оставить видимым только пункт, равный wanted (сначала показать нужный, потом скрыть остальные)."""
+    """Оставить в СТРАНИЧНОМ поле единственный выбранный пункт == wanted.
+
+    Одиночный выбор делаем через CurrentPage, а НЕ переключением .Visible у пунктов.
+    Если выбирать пункт через .Visible, Excel включает режим множественного выбора
+    (EnableMultiplePageItems) и в самом фильтре показывает «(несколько элементов)»,
+    даже когда реально виден один пункт. CurrentPage даёт одиночный выбор — в фильтре
+    отображается подпись самого пункта («Нет»).
+
+    Запасной путь (если CurrentPage не сработал) — старый способ через .Visible:
+    подпись может стать «(несколько элементов)», но данные отфильтруются правильно."""
     target = norm(wanted)
+    exact = None
+    for it in _pivot_items(pf):
+        try:
+            if norm(it.Value) == target:
+                exact = it.Value                # точная подпись пункта (реальный регистр/пробелы)
+                break
+        except Exception:
+            pass
+    if exact is None:
+        raise ValueError("пункт «%s» не найден в поле «%s»" % (wanted, pf.Name))
+
+    # Основной путь: одиночный выбор через CurrentPage.
+    try:
+        try:
+            pf.EnableMultiplePageItems = False   # иначе CurrentPage недоступен
+        except Exception:
+            pass
+        pf.CurrentPage = str(exact)
+        return
+    except Exception as e:
+        log.warning("CurrentPage для «%s» не сработал (%s) — переключаюсь на .Visible", pf.Name, e)
+
+    # Запасной путь: показать нужный пункт, скрыть остальные.
     items = _pivot_items(pf)
     for it in items:
         try:
